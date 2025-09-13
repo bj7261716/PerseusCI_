@@ -50,18 +50,55 @@ if [ ! -f "${bundle_id}.apk" ]; then
 fi
 
 echo "Decompile Azur Lane apk"
-java -jar apktool.jar -q -f d ${bundle_id}.apk
+# apktool expects the command (d|b) before options. Some apktool builds do not support -q.
+# Use the documented syntax: "d -f <apk>" to force overwrite if needed.
+java -jar apktool.jar d -f ${bundle_id}.apk
 
 echo "Copy Perseus libs"
-cp -r Perseus/src/libs/. ${bundle_id}/lib/
+# Ensure target lib directory exists before copying
+mkdir -p ${bundle_id}/lib/
+if [ -d "Perseus/src/libs" ]; then
+    cp -r Perseus/src/libs/. ${bundle_id}/lib/
+else
+    echo "Warning: Perseus/src/libs not found. Skipping library copy."
+fi
 
 echo "Patching Azur Lane with Perseus"
-oncreate=$(grep -n -m 1 'onCreate' ${bundle_id}/smali_classes2/com/unity3d/player/UnityPlayerActivity.smali | sed  's/[0-9]*\:\(.*\)/\1/')
-sed -ir "s#\($oncreate\)#.method private static native init(Landroid/content/Context;)V\n.end method\n\n\1#" ${bundle_id}/smali_classes2/com/unity3d/player/UnityPlayerActivity.smali
-sed -ir "s#\($oncreate\)#\1\n    const-string v0, \"Perseus\"\n\n\    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n\n    invoke-static {p0}, Lcom/unity3d/player/UnityPlayerActivity;->init(Landroid/content/Context;)V\n#" ${bundle_id}/smali_classes2/com/unity3d/player/UnityPlayerActivity.smali
+# Try to locate UnityPlayerActivity.smali in a few common locations. Use find as a fallback.
+target_smali=""
+possible_paths=("${bundle_id}/smali_classes2/com/unity3d/player/UnityPlayerActivity.smali" "${bundle_id}/smali/com/unity3d/player/UnityPlayerActivity.smali")
+for p in "${possible_paths[@]}"; do
+    if [ -f "$p" ]; then
+        target_smali="$p"
+        break
+    fi
+done
+if [ -z "$target_smali" ]; then
+    echo "UnityPlayerActivity.smali not found in common locations, searching..."
+    target_smali=$(find ${bundle_id} -type f -name 'UnityPlayerActivity.smali' -print -quit || true)
+fi
+
+if [ -z "$target_smali" ]; then
+    echo "Error: UnityPlayerActivity.smali not found. Skipping smali patch." >&2
+else
+    echo "Found smali: $target_smali"
+    # Backup original smali before editing
+    cp "$target_smali" "${target_smali}.bak"
+    oncreate=$(grep -n -m 1 'onCreate' "$target_smali" | sed 's/^[0-9]*:\(.*\)/\1/')
+    if [ -z "$oncreate" ]; then
+        echo "Could not locate onCreate line in $target_smali. Skipping insertion." >&2
+    else
+        # Insert native method declaration before onCreate
+        sed -i -r "s#($oncreate)#.method private static native init(Landroid/content/Context;)V\n.end method\n\n\\1#" "$target_smali"
+        # Insert loadLibrary and init call after the onCreate line
+        sed -i -r "s#($oncreate)#\\1\n    const-string v0, \"Perseus\"\n\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n\n    invoke-static {p0}, Lcom/unity3d/player/UnityPlayerActivity;->init(Landroid/content/Context;)V\n#" "$target_smali"
+    fi
+fi
 
 echo "Build Patched Azur Lane apk"
-java -jar apktool.jar -q -f b ${bundle_id} -o build/${bundle_id}.patched.apk
+# Ensure build directory exists
+mkdir -p build
+java -jar apktool.jar b -f ${bundle_id} -o build/${bundle_id}.patched.apk
 
 echo "Set Github Release version"
 version=($(jq -r '.version_name' AzurLane/manifest.json))
